@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import time
 import traceback
+from argparse import Namespace
 from pathlib import Path
 from typing import Callable
 
@@ -38,9 +39,11 @@ def _profile_this_rank() -> bool:
     return torch.distributed.get_rank(group=torch.distributed.group.WORLD) in ranks
 
 
-def _get_rank_tag() -> str:
-    """Build a rank tag string like ``rank0_dp0_tp0_pp0`` from Megatron mpu."""
-    global_rank = torch.distributed.get_rank()
+def _get_rank_tag(args: Namespace) -> str:
+    """根据训练后端生成 global、DP、TP 与 PP rank 名称。"""
+    global_rank = torch.distributed.get_rank(group=torch.distributed.group.WORLD)
+    if args.train_backend == "fsdp":
+        return f"rank{global_rank}_dp{global_rank}_tp0_pp0"
     from megatron.core import mpu
 
     dp = mpu.get_data_parallel_rank(with_context_parallel=True)
@@ -164,7 +167,7 @@ def _create_train_trace_handler(trace_dir: str, worker_name: str) -> Callable[[t
 
 def _create_torch_profiler(args, name):
     trace_dir = _get_train_trace_dir(args)
-    worker_name = f"{name}_{_get_rank_tag()}"
+    worker_name = f"{name}_{_get_rank_tag(args)}"
     return torch.profiler.profile(
         schedule=torch.profiler.schedule(
             # TODO the train_actor and train_log_probs ones may need to have different args to control step
@@ -197,7 +200,7 @@ class _BaseMemoryProfiler:
         if snapshot_dir is None:
             snapshot_dir = os.path.join(_get_trace_base_dir(args), "memory_snapshot")
         os.makedirs(snapshot_dir, exist_ok=True)
-        rank_tag = _get_rank_tag()
+        rank_tag = _get_rank_tag(args)
         self._path_dump = (
             Path(snapshot_dir) / f"memory_snapshot_time{time.time()}_{rank_tag}_{args.memory_snapshot_path}"
         )

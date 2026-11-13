@@ -67,9 +67,13 @@ def test_train_profiler_exports_python_operator_call_stacks(monkeypatch, tmp_pat
         return original_profile(activities=[torch.profiler.ProfilerActivity.CPU], **kwargs)
 
     monkeypatch.setattr(torch.profiler, "profile", cpu_profile)
-    monkeypatch.setattr(profile_utils, "_get_rank_tag", lambda: "rank0_dp0_tp0_pp0")
     monkeypatch.setattr(profile_utils, "_get_train_trace_dir", lambda args: str(tmp_path))
     args = Namespace(
+        train_backend="fsdp",
+        use_pytorch_profiler=True,
+        record_memory_history=False,
+        profile_target=["train_overall"],
+        tb_experiment_name="fsdp-profile",
         profile_step_start=0,
         profile_step_end=0,
         profile_with_stack=True,
@@ -77,11 +81,18 @@ def test_train_profiler_exports_python_operator_call_stacks(monkeypatch, tmp_pat
         profile_with_flops=False,
     )
     tensor = torch.randn(16)
-    with profile_utils._create_torch_profiler(args, "stack-test") as profiler:
+    torch.distributed.init_process_group("gloo", init_method=(tmp_path / "rendezvous").as_uri(), rank=0, world_size=1)
+    try:
+        profiler = profile_utils.TrainProfiler(args)
+        profiler.on_init_end()
         _python_stack_probe_leaf(tensor)
-        profiler.step()
+        profiler.step(0)
+        profiler._torch_profiler_overall.stop()
+    finally:
+        torch.distributed.destroy_process_group()
     files = list(tmp_path.glob("*.pt.trace.json.gz"))
     assert len(files) == 1
+    assert files[0].name.startswith("train_overall_rank0_dp0_tp0_pp0.")
     with gzip.open(files[0], "rt") as stream:
         events = json.load(stream)["traceEvents"]
     assert any(
