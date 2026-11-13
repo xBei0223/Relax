@@ -71,6 +71,20 @@ def sample() -> dict:
     }
 
 
+@pytest.mark.parametrize("phase", ["forward", "backward"])
+def test_experiment_fault_is_raised_at_selected_phase(model, tmp_path, phase):
+    model._experiment_fault = {"phase": phase, "output_dir": str(tmp_path), "step": 40, "micro": 1, "rank": 0}
+    if phase == "forward":
+        with pytest.raises(RuntimeError, match="Task17 injected forward failure"):
+            model(sample())
+    else:
+        loss = model(sample())
+        with pytest.raises(RuntimeError, match="Task17 injected backward failure"):
+            loss.backward()
+    event = json.loads((tmp_path / "events_rank0.jsonl").read_text())
+    assert (event["event"], event["step"], event["micro"], event["phase"]) == ("fault", 40, 1, phase)
+
+
 def test_condition_input_identity_and_managed_tokenizer_update(model: SenseNovaSFTModel) -> None:
     adapter = SenseNovaSFTAdapter()
     cache = ConditionCacheBinding(model, adapter, torch.device("cpu"), {})

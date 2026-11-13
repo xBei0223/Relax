@@ -129,6 +129,7 @@ class FSDPSFTTrainer:
                     "condition_cache_enabled",
                     "condition_cache_max_entries",
                     "condition_cache_max_bytes",
+                    "experiment_diagnostics",
                 )
             },
             "world_size": self.world,
@@ -207,7 +208,18 @@ class FSDPSFTTrainer:
             if getattr(pipe, "dit", None) is not None:
                 pipe.dit.tracker = self.tracker
         self.condition_cache = None
+        self.diagnostics = None
         try:
+            if config.get("experiment_diagnostics") is not None:
+                from relax.backends.fsdp.sft_diagnostics import SFTDiagnostics
+
+                self.diagnostics = SFTDiagnostics(
+                    actor.model,
+                    config["experiment_diagnostics"],
+                    self.rank,
+                    self.world,
+                    self.args.global_batch_size // self.world,
+                )
             if cache_enabled:
                 self._init_condition_cache()
             self.profiler.on_init_end()
@@ -384,6 +396,8 @@ class FSDPSFTTrainer:
             try:
                 if cache is not None:
                     self._prepare_conditions(data, step, micro, len(ids))
+                if self.diagnostics is not None:
+                    self.actor.model._experiment_fault = self.diagnostics.fault_for(step + 1, micro + 1)
                 loss = self.actor.model(data)
                 torch._assert_async(torch.isfinite(loss), "Non-finite SFT loss")
                 scaled_loss = loss / len(ids)
@@ -397,6 +411,7 @@ class FSDPSFTTrainer:
                 data = loss = scaled_loss = None
                 if cache is not None:
                     cache.end_micro()
+        before = self.diagnostics.before_optimizer(step + 1) if self.diagnostics is not None else None
         if tracker is not None:
             with tracker.gpu_stage("optimizer_ms"):
                 norm = clip_sharded_gradients(self.parameters, self.args.clip_grad, self.group)
@@ -406,6 +421,9 @@ class FSDPSFTTrainer:
             norm = clip_sharded_gradients(self.parameters, self.args.clip_grad, self.group)
             lr = optimizer.param_groups[0]["lr"]
             optimizer.step()
+        if self.diagnostics is not None:
+            self.diagnostics.after_optimizer(step + 1, before, self)
+            before = None
         self.scheduler.step()
         optimizer.zero_grad(set_to_none=True)
         self.step += 1

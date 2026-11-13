@@ -91,6 +91,8 @@ if os.environ["IMAGE_DP_TIER_RANK_ROTATION"] == "1":
 if os.environ.get("BASELINE_STATS_DIR", "").strip():
     config["baseline_stats_dir"] = os.environ["BASELINE_STATS_DIR"].strip()
     config["baseline_warmup_steps"] = int(os.environ.get("BASELINE_WARMUP_STEPS", "5"))
+if os.environ.get("SFT_EXPERIMENT_DIAGNOSTICS", "").strip():
+    config["experiment_diagnostics"] = json.loads(os.environ["SFT_EXPERIMENT_DIAGNOSTICS"])
 print(json.dumps(config))
 PY
 )

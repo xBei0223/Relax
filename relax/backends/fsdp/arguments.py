@@ -664,10 +664,14 @@ def validate_i2i_sft_config(args: Namespace) -> None:
             "dp_tier_rank_rotation",
             "baseline_stats_dir",
             "baseline_warmup_steps",
+            "experiment_diagnostics",
         }
     )
     _fail(errors, bool(unknown), f"Unknown i2i_sft_config keys: {sorted(unknown)}")
     args.i2i_sft_config = config = {**defaults, **config}
+    from relax.backends.fsdp.sft_diagnostics import validate_diagnostics
+
+    validate_diagnostics(config.get("experiment_diagnostics"))
     _fail(errors, type(config["condition_cache_enabled"]) is not bool, "condition_cache_enabled must be boolean")
     for field in ("condition_cache_max_entries", "condition_cache_max_bytes"):
         value = config[field]

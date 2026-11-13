@@ -173,7 +173,17 @@ class SenseNovaSFTModel(torch.nn.Module):
                             "indexes_image": inputs[1]["indexes_image"],
                         },
                     )
-        return flow_matching_loss(self.pipe, {**inputs[0], **inputs[1]})
+        fault = getattr(self, "_experiment_fault", None)
+        if fault is not None and fault["phase"] == "forward":
+            from relax.backends.fsdp.sft_diagnostics import raise_injected_fault
+
+            raise_injected_fault(fault)
+        loss = flow_matching_loss(self.pipe, {**inputs[0], **inputs[1]})
+        if fault is not None and fault["phase"] == "backward":
+            from relax.backends.fsdp.sft_diagnostics import raise_injected_fault
+
+            loss.register_hook(lambda gradient: raise_injected_fault(fault))
+        return loss
 
 
 class SenseNovaSFTAdapter:

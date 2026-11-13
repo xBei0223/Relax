@@ -12,6 +12,7 @@ import torch.distributed as dist
 from relax.backends.fsdp.condition_cache import ConditionCacheBinding
 from relax.backends.fsdp.runtime import fsdp2_wrap
 from relax.backends.fsdp.sft import FSDPSFTTrainer
+from relax.backends.fsdp.sft_diagnostics import SFTDiagnostics
 from relax.models.sensenova.adapter import SenseNovaSFTAdapter
 from tests.cpu.models.test_sensenova_condition_cache import build_model, sample
 
@@ -54,6 +55,17 @@ def _worker(rank: int, directory: str) -> None:
             trainer.world, trainer.control_group, trainer.condition_cache = 2, control, cache
             parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
             optimizer = torch.optim.SGD(parameters, lr=0.01)
+            diagnostics = (
+                SFTDiagnostics(
+                    model,
+                    {"output_dir": str(root / "diagnostics"), "record_parameters": True, "tensor_steps": [1]},
+                    rank,
+                    2,
+                    2,
+                )
+                if enabled
+                else None
+            )
             torch.manual_seed(192 + rank)
             history = []
             try:
@@ -81,7 +93,10 @@ def _worker(rank: int, directory: str) -> None:
                         if enabled:
                             cache.end_micro()
                     gradients = [parameter.grad.to_local().detach().cpu().clone() for parameter in parameters]
+                    snapshots = diagnostics.before_optimizer(step + 1) if diagnostics is not None else None
                     optimizer.step()
+                    if diagnostics is not None:
+                        diagnostics.after_optimizer(step + 1, snapshots, trainer)
                     updates = [
                         (parameter.to_local().detach() - previous).cpu()
                         for parameter, previous in zip(parameters, before, strict=True)
