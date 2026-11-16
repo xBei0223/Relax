@@ -1,0 +1,14 @@
+{
+    "features": {
+        "containerd-snapshotter": false
+    },
+    "storage-driver": "overlay2",
+    "max-concurrent-downloads": 8,
+    "max-download-attempts": 10,
+    "runtimes": {
+        "nvidia": {
+            "args": [],
+            "path": "nvidia-container-runtime"
+        }
+    }
+}
