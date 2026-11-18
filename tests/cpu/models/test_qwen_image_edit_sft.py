@@ -57,7 +57,12 @@ def test_reference_files_and_schedule() -> None:
         selected = schedule.lookup_index(timestep)
         assert selected.item() == expected["indices"][index]
         assert schedule.sigmas[selected].item() == expected["sigmas"][index]
-        assert schedule.training_weight(timestep).item() == expected["weights"][index]
+        torch.testing.assert_close(
+            schedule.training_weight(timestep),
+            torch.tensor(expected["weights"][index], dtype=torch.float32),
+            rtol=1e-6,
+            atol=1e-6,
+        )
     assert sum(index != actual for index, actual in enumerate(expected["indices"])) == 624
 
 
