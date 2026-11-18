@@ -578,10 +578,8 @@ class FSDPTrainRayActor(TrainRayActor):
         """Enforce the configured trainable boundary at runtime (design doc
         13.1).
 
-        Full FT: every parameter must be trainable. LoRA: the adapter must
-        exist and the base must be frozen — a LoRA run that silently kept the
-        base trainable would blow past its memory budget and, worse, would sync
-        a base the engine's adapter was never trained against.
+        Full SFT keeps declared encoder modules frozen. LoRA requires adapter
+        parameters and a frozen base.
         """
         if self._trainable_mode == "lora":
             from relax.backends.fsdp.lora import is_lora_injected
@@ -595,7 +593,15 @@ class FSDPTrainRayActor(TrainRayActor):
                     f"{trainable_base[:5]}..."
                 )
             return
-        frozen_trainable = [n for n, p in self.model.named_parameters() if not p.requires_grad]
+        frozen_prefixes = self.adapter.frozen_module_prefixes if is_i2i_sft(self.args) else ()
+        unexpected_trainable = [
+            n for n, p in self.model.named_parameters() if n.startswith(frozen_prefixes) and p.requires_grad
+        ]
+        if unexpected_trainable:
+            raise ValueError(f"SFT frozen modules contain trainable parameters: {unexpected_trainable[:5]}")
+        frozen_trainable = [
+            n for n, p in self.model.named_parameters() if not n.startswith(frozen_prefixes) and not p.requires_grad
+        ]
         if frozen_trainable:
             raise ValueError(
                 f"train_backend=fsdp requires all transformer params trainable; frozen: {frozen_trainable[:5]}..."

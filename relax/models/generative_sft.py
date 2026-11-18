@@ -14,6 +14,24 @@ class GenerativeSFTAdapter(Protocol):
     family: str
     supported_tasks: tuple[str, ...]
     lora_target_modules: tuple[str, ...]
+    image_tier_policy: bool
+    cpu_only_prepare_sample: bool
+    frozen_module_prefixes: tuple[str, ...]
+    condition_skip_counters: tuple[str, ...]
+
+    @staticmethod
+    def validate_sft_config(config: dict[str, Any]) -> list[str]:
+        """Return model-specific configuration errors."""
+        ...
+
+    def bind_tracker(self, model: torch.nn.Module, tracker: Any | None) -> None:
+        """Attach the online encoding tracker to the model."""
+        ...
+
+    @staticmethod
+    def tracker_schema() -> Any:
+        """Return the model's encoding and transfer declarations."""
+        ...
 
     def load_train_model(self, args: Any) -> torch.nn.Module:
         """Return the complete forward root: model(sample) yields scalar

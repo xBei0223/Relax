@@ -399,7 +399,7 @@ class SenseNovaU1ImageUnit_PromptEmbedder(PipelineUnit):
             tracker.record_encode(
                 "ref_vision_encode",
                 int(grid_hw.shape[0]),
-                output_bytes=vision_embeds.numel() * vision_embeds.element_size(),
+                feature_bytes={"ref_vision_embeds_bytes": vision_embeds.numel() * vision_embeds.element_size()},
             )
         selected = input_ids.reshape(-1) == pipe.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         inputs_embeds = inputs_embeds.reshape(-1, channels)
@@ -490,8 +490,10 @@ class SenseNovaU1ImageUnit_PromptEmbedder(PipelineUnit):
             tracker.record_encode(
                 "prefix_encode",
                 1,
-                output_bytes=tracker.compute_kv_bytes(past_key_values),
-                indexes_image_bytes=indexes_image.numel() * indexes_image.element_size(),
+                feature_bytes={
+                    "past_key_values_bytes": tracker.compute_kv_bytes(past_key_values),
+                    "indexes_image_bytes": indexes_image.numel() * indexes_image.element_size(),
+                },
             )
         return {"past_key_values": past_key_values, "indexes_image": indexes_image}
 
@@ -561,7 +563,6 @@ def model_fn_sensenova_u1_image(
         tracker.record_encode(
             "gen_vision_encode",
             int(latents.shape[0]),
-            output_bytes=image_embeds.numel() * image_embeds.element_size(),
             eligible=False,
         )
     image_embeds = image_embeds + dit.embed_timestep(t, noise_scale, num_tokens, batch_size=latents.shape[0])

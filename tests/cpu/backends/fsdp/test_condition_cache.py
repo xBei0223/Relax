@@ -15,6 +15,8 @@ from relax.engine.sft.condition_cache import ConditionFieldSpec, ConditionReques
 
 
 class Adapter:
+    condition_skip_counters = ("skipped_prefix_encodes", "skipped_vision_encodes")
+
     def condition_field_specs(self, model: torch.nn.Module) -> tuple[ConditionFieldSpec, ...]:
         return (ConditionFieldSpec("features", ("output",), ("encoder",), ("input",), ("preprocess",), 1),)
 

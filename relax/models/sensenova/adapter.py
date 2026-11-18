@@ -183,6 +183,26 @@ class SenseNovaSFTAdapter:
     supported_tasks = ("i2i",)
     lora_target_modules = LORA_TARGETS
     lora_task_type = "FEATURE_EXTRACTION"
+    image_tier_policy = True
+    cpu_only_prepare_sample = True
+    frozen_module_prefixes = ()
+    condition_skip_counters = ("skipped_prefix_encodes", "skipped_vision_encodes")
+
+    @staticmethod
+    def validate_sft_config(config: dict[str, Any]) -> list[str]:
+        if "transformer_gradient_checkpointing" in config:
+            return ["SenseNova does not support transformer_gradient_checkpointing"]
+        return []
+
+    @staticmethod
+    def tracker_schema() -> Any:
+        from relax.engine.sft.condition_tracker import SENSENOVA_TRACKER_SCHEMA
+
+        return SENSENOVA_TRACKER_SCHEMA
+
+    def bind_tracker(self, model: SenseNovaSFTModel, tracker: Any | None) -> None:
+        model.pipe.tracker = tracker
+        model.pipe.dit.tracker = tracker
 
     def load_train_model(self, args: Any) -> SenseNovaSFTModel:
         from .pipeline import SenseNovaU1ImagePipeline

@@ -9,8 +9,9 @@ import resource
 import sys
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator, Mapping
 
 import numpy as np
 import torch
@@ -57,6 +58,154 @@ FEATURE_BYTE_KEYS = (
     "ref_vision_embeds_bytes",
     "past_key_values_bytes",
     "indexes_image_bytes",
+)
+
+
+@dataclass(frozen=True)
+class TransferSpec:
+    kind: str
+    key_field: str
+    per_image: bool = False
+    repeat_flag: str | None = None
+
+
+@dataclass(frozen=True)
+class EncodeSpec:
+    kind: str
+    key_field: str | None
+    stage: str
+    eligible: bool | None = None
+    feature_bytes: tuple[str, ...] = ()
+    items_field: str | None = None
+    repeat_flag: str | None = None
+    global_repeat: bool = True
+
+
+@dataclass(frozen=True)
+class EvidenceSpec:
+    key_field: str
+    extra_key_fields: tuple[str, ...]
+    h2d_name: str
+    h2d_transfers: tuple[str, ...]
+    stages: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TrackerSchema:
+    name: str
+    stage_order: tuple[str, ...]
+    host_stages: tuple[str, ...]
+    micro_gpu_stages: tuple[str, ...]
+    key_fields: tuple[str, ...]
+    micro_keys: Callable[..., dict[str, Any]]
+    transfers: tuple[TransferSpec, ...]
+    encodes: tuple[EncodeSpec, ...]
+    host_repeat_stages: tuple[tuple[str, str], ...]
+    condition_stages: tuple[str, ...]
+    evidence: EvidenceSpec
+    prefix_context: Callable[..., None] | None = None
+
+    @property
+    def feature_byte_keys(self) -> tuple[str, ...]:
+        return tuple(key for spec in self.encodes for key in spec.feature_bytes)
+
+    @property
+    def repeatable_stages(self) -> tuple[str, ...]:
+        stages = {stage for stage, _ in self.host_repeat_stages}
+        stages.update(spec.stage for spec in self.encodes if spec.global_repeat)
+        return tuple(stage for stage in self.stage_order if stage in stages or stage == "train_ms")
+
+
+def _sensenova_micro_keys(
+    row: dict[str, Any], config: dict[str, Any], budget: int | None, height: int, width: int, training_mode: str
+) -> dict[str, Any]:
+    edit_paths = [str(path) for path in row["edit_image"]]
+    max_pixels = int(config["max_pixels"])
+    ref_image_keys = [_sha256_key([path, max_pixels, budget, len(edit_paths)]) for path in edit_paths]
+    ref_vision_key = _sha256_key(ref_image_keys)
+    return {
+        "ref_image_keys": ref_image_keys,
+        "ref_vision_key": ref_vision_key,
+        "prefix_kv_key": _sha256_key(
+            [
+                str(row["prompt"]),
+                True,
+                ref_vision_key,
+                height,
+                width,
+                bool(config.get("think_mode", False)),
+                training_mode,
+            ]
+        ),
+        "target_image_key": _sha256_key([str(row["image"]), max_pixels, budget]),
+        "eligible": training_mode == "lora",
+    }
+
+
+def _sensenova_prefix_context(tracker: Any, prompt: str, is_positive: bool, think_mode: bool) -> None:
+    tracker.current_is_positive = bool(is_positive)
+    key = _sha256_key(
+        [
+            str(prompt),
+            tracker.current_is_positive,
+            tracker.current_keys["ref_vision_key"],
+            tracker.current_height,
+            tracker.current_width,
+            bool(think_mode),
+            tracker.current_training_mode,
+        ]
+    )
+    tracker.current_keys["prefix_kv_key"] = key
+    if tracker.current_is_positive:
+        micro_rec = tracker._current_micro_records.get(tracker.current_micro)
+        if micro_rec is not None:
+            micro_rec["prefix_kv_key"] = key
+
+
+SENSENOVA_TRACKER_SCHEMA = TrackerSchema(
+    name="relax.engine.sft.condition_tracker.SENSENOVA_TRACKER_SCHEMA",
+    stage_order=ALL_STAGE_NAMES,
+    host_stages=HOST_STAGES,
+    micro_gpu_stages=MICRO_GPU_STAGES,
+    key_fields=("ref_image_keys", "ref_vision_key", "prefix_kv_key", "target_image_key"),
+    micro_keys=_sensenova_micro_keys,
+    transfers=(
+        TransferSpec("ref_pixel_values", "ref_image_keys", True, "ref_image_repeated"),
+        TransferSpec("ref_grid_hw", "ref_image_keys", True),
+        TransferSpec("prefix_input_ids", "prefix_kv_key"),
+        TransferSpec("target_input_latents", "target_image_key", repeat_flag="target_image_repeated"),
+    ),
+    encodes=(
+        EncodeSpec(
+            "ref_vision_encode",
+            "ref_vision_key",
+            "ref_vision_encode_ms",
+            feature_bytes=("ref_vision_embeds_bytes",),
+            items_field="encoded_images",
+            repeat_flag="ref_vision_repeated",
+        ),
+        EncodeSpec(
+            "prefix_encode",
+            "prefix_kv_key",
+            "prefix_encode_ms",
+            feature_bytes=("past_key_values_bytes", "indexes_image_bytes"),
+            repeat_flag="prefix_kv_repeated",
+        ),
+        EncodeSpec("gen_vision_encode", None, "gen_vision_encode_ms", eligible=False, global_repeat=False),
+    ),
+    host_repeat_stages=(
+        ("ref_image_preprocess_ms", "ref_pixel_values"),
+        ("target_image_preprocess_ms", "target_input_latents"),
+    ),
+    condition_stages=("ref_image_preprocess_ms", "ref_vision_encode_ms", "prefix_encode_ms"),
+    evidence=EvidenceSpec(
+        "prefix_kv_key",
+        ("ref_vision_key",),
+        "ref_h2d",
+        ("ref_pixel_values", "ref_grid_hw", "prefix_input_ids"),
+        ("ref_image_preprocess_ms", "ref_vision_encode_ms", "prefix_encode_ms"),
+    ),
+    prefix_context=_sensenova_prefix_context,
 )
 
 
@@ -171,10 +320,14 @@ class ConditionTracker:
         output_dir: Path,
         warmup_steps: int = 5,
         seed: int | None = None,
+        schema: TrackerSchema = SENSENOVA_TRACKER_SCHEMA,
     ) -> None:
         if rank < 0 or world_size <= 0 or micro_batches <= 0 or dataset_size <= 0 or warmup_steps < 0:
             raise ValueError("Invalid ConditionTracker configuration")
         self.rank = int(rank)
+        self.schema = schema
+        self.transfer_specs = {spec.kind: spec for spec in schema.transfers}
+        self.encode_specs = {spec.kind: spec for spec in schema.encodes}
         self.world_size = int(world_size)
         self.micro_batches = int(micro_batches)
         self.global_batch_size = self.micro_batches * self.world_size
@@ -195,7 +348,7 @@ class ConditionTracker:
         self._step_event_pool: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
         if self._cuda_available:
             for micro in range(self.micro_batches):
-                for stage in MICRO_GPU_STAGES:
+                for stage in schema.micro_gpu_stages:
                     self._event_pool[(micro, stage)] = [
                         (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)),
                         (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)),
@@ -216,42 +369,23 @@ class ConditionTracker:
         self._epoch_seen_sample_ids: set[int] = set()
         self._step_padding_flags: list[bool] | None = None
 
-        self.seen_encode_keys: dict[str, set[str]] = {k: set() for k in ENCODE_KINDS}
+        self.seen_encode_keys: dict[str, set[str]] = {k: set() for k in self.encode_specs}
         self.encode_stats: dict[str, dict[str, Any]] = {
-            "ref_vision_encode": {
-                "eligible": None,
+            spec.kind: {
+                "eligible": spec.eligible,
                 "calls": 0,
-                "encoded_images": 0,
+                **({spec.items_field: 0} if spec.items_field else {}),
                 "items": 0,
                 "repeated_calls": 0,
                 "cache_lookups": 0,
                 "cache_hits": 0,
                 "cache_misses": 0,
                 "cache_hit_rate": 0.0,
-            },
-            "prefix_encode": {
-                "eligible": None,
-                "calls": 0,
-                "items": 0,
-                "repeated_calls": 0,
-                "cache_lookups": 0,
-                "cache_hits": 0,
-                "cache_misses": 0,
-                "cache_hit_rate": 0.0,
-            },
-            "gen_vision_encode": {
-                "eligible": False,
-                "calls": 0,
-                "items": 0,
-                "repeated_calls": 0,
-                "cache_lookups": 0,
-                "cache_hits": 0,
-                "cache_misses": 0,
-                "cache_hit_rate": 0.0,
-            },
+            }
+            for spec in schema.encodes
         }
 
-        self.seen_transfer_keys: dict[str, set[str]] = {k: set() for k in TRANSFER_KINDS}
+        self.seen_transfer_keys: dict[str, set[str]] = {k: set() for k in self.transfer_specs}
         self.transfer_stats: dict[str, dict[str, int]] = {
             k: {
                 "total_transfer_calls": 0,
@@ -259,9 +393,9 @@ class ConditionTracker:
                 "repeated_transfer_calls": 0,
                 "repeated_transfer_bytes": 0,
             }
-            for k in TRANSFER_KINDS
+            for k in self.transfer_specs
         }
-        self.feature_byte_records: dict[str, list[int]] = {k: [] for k in FEATURE_BYTE_KEYS}
+        self.feature_byte_records: dict[str, list[int]] = {k: [] for k in schema.feature_byte_keys}
         self.step_records: list[dict[str, Any]] = []
 
         self.current_step: int = 0
@@ -273,11 +407,7 @@ class ConditionTracker:
         self.current_width: int = 0
         self.current_budget: int | None = None
         self.current_is_positive: bool = True
-        self.current_ref_image_keys: list[str] = []
-        self.current_ref_vision_key: str = ""
-        self.current_positive_prefix_kv_key: str = ""
-        self.current_prefix_kv_key: str = ""
-        self.current_target_image_key: str = ""
+        self.current_keys: dict[str, Any] = {}
         self.current_eligible: bool = True
 
         self._recorded_micro_event_counts: dict[tuple[int, str], int] = {}
@@ -369,34 +499,12 @@ class ConditionTracker:
         self.current_height = int(height)
         self.current_width = int(width)
         self.current_is_positive = True
-        max_pixels = int(config["max_pixels"])
         budget = image_tier_budget(config, self.current_sample_id)
         self.current_budget = budget
 
-        edit_paths = [str(path) for path in row["edit_image"]]
-        num_ref_images = len(edit_paths)
-        ref_image_keys = [_sha256_key([path, max_pixels, budget, num_ref_images]) for path in edit_paths]
-        ref_vision_key = _sha256_key(ref_image_keys)
-        think_mode = bool(config.get("think_mode", False))
-        prefix_kv_key = _sha256_key(
-            [
-                str(row["prompt"]),
-                True,
-                ref_vision_key,
-                self.current_height,
-                self.current_width,
-                think_mode,
-                self.current_training_mode,
-            ]
-        )
-        target_image_key = _sha256_key([str(row["image"]), max_pixels, budget])
-        eligible = self.current_training_mode == "lora"
-
-        self.current_ref_image_keys = ref_image_keys
-        self.current_ref_vision_key = ref_vision_key
-        self.current_positive_prefix_kv_key = prefix_kv_key
-        self.current_prefix_kv_key = prefix_kv_key
-        self.current_target_image_key = target_image_key
+        keys = self.schema.micro_keys(row, config, budget, height, width, training_mode)
+        eligible = keys["eligible"]
+        self.current_keys = {key: keys[key] for key in self.schema.key_fields}
         self.current_eligible = eligible
 
         self.total_samples += 1
@@ -428,42 +536,30 @@ class ConditionTracker:
             "fixed_pixels_budget": budget,
             "is_padding": is_padding,
             "is_repeated_sample": is_repeated_sample,
-            "ref_image_keys": ref_image_keys,
-            "ref_vision_key": ref_vision_key,
-            "prefix_kv_key": prefix_kv_key,
-            "target_image_key": target_image_key,
-            "ref_image_repeated": False,
-            "ref_vision_repeated": False,
-            "prefix_kv_repeated": False,
-            "target_image_repeated": False,
+            **self.current_keys,
+            **{spec.repeat_flag: False for spec in (*self.schema.transfers, *self.schema.encodes) if spec.repeat_flag},
             "transfers": {
-                k: {"calls": 0, "bytes": 0, "repeated_calls": 0, "repeated_bytes": 0} for k in TRANSFER_KINDS
+                k: {"calls": 0, "bytes": 0, "repeated_calls": 0, "repeated_bytes": 0, "events": []}
+                for k in self.transfer_specs
             },
             "encodes": {},
             "feature_bytes": {},
-            "timings_ms": {stage: 0.0 for stage in (*HOST_STAGES, *MICRO_GPU_STAGES)},
+            "timings_ms": {stage: 0.0 for stage in (*self.schema.host_stages, *self.schema.micro_gpu_stages)},
         }
 
     def set_prefix_context(self, prompt: str, is_positive: bool, think_mode: bool) -> None:
         """Set the prefix key of the next positive or negative encode."""
-        self.current_is_positive = bool(is_positive)
-        key = _sha256_key(
-            [
-                str(prompt),
-                self.current_is_positive,
-                self.current_ref_vision_key,
-                self.current_height,
-                self.current_width,
-                bool(think_mode),
-                self.current_training_mode,
-            ]
-        )
-        self.current_prefix_kv_key = key
-        if self.current_is_positive:
-            self.current_positive_prefix_kv_key = key
-            micro_rec = self._current_micro_records.get(self.current_micro)
-            if micro_rec is not None:
-                micro_rec["prefix_kv_key"] = key
+        if self.schema.prefix_context is None:
+            raise ValueError(f"Tracker schema {self.schema.name} has no prefix context")
+        self.schema.prefix_context(self, prompt, is_positive, think_mode)
+
+    def add_host_time(self, stage: str, ms: float) -> None:
+        """Add host time measured during sample preparation."""
+        if stage not in self.schema.host_stages or not math.isfinite(ms) or ms < 0:
+            raise ValueError(f"Invalid host timing: {stage}={ms}")
+        micro_rec = self._current_micro_records.get(self.current_micro)
+        if micro_rec is not None:
+            micro_rec["timings_ms"][stage] += ms
 
     @staticmethod
     def compute_kv_bytes(past_key_values: Any) -> int:
@@ -529,7 +625,9 @@ class ConditionTracker:
                     if micro_rec is not None:
                         micro_rec["timings_ms"][name] = micro_rec["timings_ms"].get(name, 0.0) + elapsed_ms
 
-    def record_transfer(self, kind: str, tensor: torch.Tensor, image_index: int = 0, key: str | None = None) -> None:
+    def record_transfer(
+        self, kind: str, tensor: torch.Tensor | tuple[torch.Tensor, ...], image_index: int = 0, key: str | None = None
+    ) -> None:
         """Record a host-to-device transfer of ``tensor``.
 
         A transfer repeats when ``key`` was seen before. ``key`` defaults to
@@ -538,19 +636,13 @@ class ConditionTracker:
         """
         if kind not in self.transfer_stats:
             raise ValueError(f"Unknown transfer kind: {kind!r}")
+        spec = self.transfer_specs[kind]
         if key is None:
-            if kind in ("ref_pixel_values", "ref_grid_hw"):
-                key = (
-                    self.current_ref_image_keys[image_index]
-                    if image_index < len(self.current_ref_image_keys)
-                    else f"{self.current_ref_vision_key}:{image_index}"
-                )
-            elif kind == "prefix_input_ids":
-                key = self.current_prefix_kv_key
-            elif kind == "target_input_latents":
-                key = self.current_target_image_key
+            key = self.current_keys[spec.key_field]
+            if spec.per_image:
+                key = key[image_index]
 
-        nbytes = int(tensor.numel() * tensor.element_size())
+        nbytes = compute_past_key_values_bytes(tensor)
         is_repeat = bool(key) and (key in self.seen_transfer_keys[kind])
         if key:
             self.seen_transfer_keys[kind].add(key)
@@ -567,68 +659,65 @@ class ConditionTracker:
             m_tr = micro_rec["transfers"][kind]
             m_tr["calls"] += 1
             m_tr["bytes"] += nbytes
+            m_tr["events"].append({"key": key, "bytes": nbytes})
             if is_repeat:
                 m_tr["repeated_calls"] += 1
                 m_tr["repeated_bytes"] += nbytes
-                if kind == "ref_pixel_values":
-                    micro_rec["ref_image_repeated"] = True
-                elif kind == "target_input_latents":
-                    micro_rec["target_image_repeated"] = True
+                if spec.repeat_flag:
+                    micro_rec[spec.repeat_flag] = True
 
     def record_encode(
         self,
         kind: str,
         num_items: int,
-        output_bytes: int = 0,
+        feature_bytes: Mapping[str, int] | None = None,
         key: str | None = None,
         eligible: bool | None = None,
-        indexes_image_bytes: int = 0,
     ) -> None:
         """Record one encoder call of ``kind`` over ``num_items`` inputs.
 
         A call repeats when ``key`` was seen before; ``key`` defaults to the
-        current reference vision or prefix key. ``output_bytes`` and
-        ``indexes_image_bytes`` record the produced feature sizes. Generated
-        image encodes are never eligible for reuse.
+        schema's current key. ``feature_bytes`` records declared output sizes.
         """
         if kind not in self.encode_stats:
             raise ValueError(f"Unknown encode kind: {kind!r}")
-        if kind == "gen_vision_encode":
-            resolved_eligible = False
-            resolved_key = None
-            is_repeat = False
-        else:
-            resolved_eligible = self.current_eligible if eligible is None else bool(eligible)
-            if key is not None:
-                resolved_key = key
-            elif kind == "ref_vision_encode":
-                resolved_key = self.current_ref_vision_key
-            else:
-                resolved_key = self.current_prefix_kv_key
-            is_repeat = bool(resolved_key) and (resolved_key in self.seen_encode_keys[kind])
-            if resolved_key:
-                self.seen_encode_keys[kind].add(resolved_key)
+        spec = self.encode_specs[kind]
+        feature_bytes = {} if feature_bytes is None else feature_bytes
+        if set(feature_bytes) - set(spec.feature_bytes):
+            raise ValueError(f"Unknown feature byte fields for {kind}: {sorted(feature_bytes)}")
+        if any(type(value) is not int or value < 0 for value in feature_bytes.values()):
+            raise ValueError("Feature byte counts must be nonnegative integers")
+        resolved_eligible = self.current_eligible if eligible is None else bool(eligible)
+        if spec.eligible is not None:
+            resolved_eligible = spec.eligible
+        resolved_key = key if key is not None else self.current_keys.get(spec.key_field)
+        if resolved_key is not None and not isinstance(resolved_key, str):
+            raise ValueError(f"Encoding {kind} requires one explicit content key per call")
+        is_repeat = bool(resolved_key) and (resolved_key in self.seen_encode_keys[kind])
+        if resolved_key:
+            self.seen_encode_keys[kind].add(resolved_key)
 
         stats = self.encode_stats[kind]
         stats["eligible"] = resolved_eligible
         stats["calls"] += 1
         stats["items"] += int(num_items)
-        if kind == "ref_vision_encode":
-            stats["encoded_images"] += int(num_items)
+        if spec.items_field:
+            stats[spec.items_field] += int(num_items)
         if is_repeat:
             stats["repeated_calls"] += 1
 
-        out_bytes = int(output_bytes)
-        idx_bytes = int(indexes_image_bytes)
-        if kind == "ref_vision_encode" and out_bytes > 0:
-            self.feature_byte_records["ref_vision_embeds_bytes"].append(out_bytes)
-        elif kind == "prefix_encode":
-            if out_bytes > 0:
-                self.feature_byte_records["past_key_values_bytes"].append(out_bytes)
-            if idx_bytes > 0:
-                self.feature_byte_records["indexes_image_bytes"].append(idx_bytes)
-
         micro_rec = self._current_micro_records.get(self.current_micro)
+        for field, nbytes in feature_bytes.items():
+            if nbytes > 0:
+                if (
+                    isinstance(self.current_keys.get(spec.key_field), (list, tuple))
+                    and micro_rec is not None
+                    and field in micro_rec["feature_bytes"]
+                ):
+                    self.feature_byte_records[field][-1] += nbytes
+                else:
+                    self.feature_byte_records[field].append(nbytes)
+
         if micro_rec is not None:
             enc_entry = micro_rec["encodes"].get(kind)
             if enc_entry is None:
@@ -653,20 +742,16 @@ class ConditionTracker:
                 enc_entry["key"] = resolved_key
             if resolved_key is not None:
                 enc_entry["keys"].append(resolved_key)
-            enc_entry["output_bytes"] += out_bytes
-
-            if kind == "ref_vision_encode":
-                if first_call_in_micro:
-                    micro_rec["ref_vision_repeated"] = is_repeat
-                if out_bytes > 0 and (first_call_in_micro or self.current_is_positive):
-                    micro_rec["feature_bytes"]["ref_vision_embeds_bytes"] = out_bytes
-            elif kind == "prefix_encode":
-                if self.current_is_positive or first_call_in_micro:
-                    micro_rec["prefix_kv_repeated"] = is_repeat
-                if out_bytes > 0 and (self.current_is_positive or first_call_in_micro):
-                    micro_rec["feature_bytes"]["past_key_values_bytes"] = out_bytes
-                if idx_bytes > 0 and (self.current_is_positive or first_call_in_micro):
-                    micro_rec["feature_bytes"]["indexes_image_bytes"] = idx_bytes
+            enc_entry["output_bytes"] += sum(feature_bytes.values())
+            if first_call_in_micro or self.current_is_positive:
+                if spec.repeat_flag:
+                    micro_rec[spec.repeat_flag] = enc_entry["repeated"]
+                for field, nbytes in feature_bytes.items():
+                    if nbytes > 0:
+                        if isinstance(self.current_keys.get(spec.key_field), (list, tuple)):
+                            micro_rec["feature_bytes"][field] = micro_rec["feature_bytes"].get(field, 0) + nbytes
+                        else:
+                            micro_rec["feature_bytes"][field] = nbytes
 
     def consume_step_memory(self, device: torch.device) -> tuple[int, int]:
         """Record the step memory peaks of ``device``.
@@ -717,48 +802,32 @@ class ConditionTracker:
         stage_timings_ms: dict[str, float] = {
             "data_wait_ms": float(data_wait_seconds) * 1000.0,
         }
-        for stage in (*HOST_STAGES, *MICRO_GPU_STAGES):
+        for stage in (*self.schema.host_stages, *self.schema.micro_gpu_stages):
             stage_timings_ms[stage] = float(sum(m["timings_ms"].get(stage, 0.0) for m in micro_list))
         for stage in STEP_GPU_STAGES:
             stage_timings_ms[stage] = float(self._current_step_timings.get(stage, 0.0))
         stage_timings_ms["train_ms"] = float(train_seconds) * 1000.0
 
-        ref_pre_rep_ms = float(
-            sum(m["timings_ms"].get("ref_image_preprocess_ms", 0.0) for m in micro_list if m["ref_image_repeated"])
-        )
-        ref_vis_rep_ms = 0.0
-        prefix_rep_ms = 0.0
-        for m in micro_list:
-            vis_enc = m["encodes"].get("ref_vision_encode")
-            if vis_enc and vis_enc["calls"] > 0:
-                ref_vis_rep_ms += float(m["timings_ms"].get("ref_vision_encode_ms", 0.0)) * (
-                    vis_enc["repeated_calls"] / vis_enc["calls"]
-                )
-            elif m["ref_vision_repeated"]:
-                ref_vis_rep_ms += float(m["timings_ms"].get("ref_vision_encode_ms", 0.0))
-
-            pref_enc = m["encodes"].get("prefix_encode")
-            if pref_enc and pref_enc["calls"] > 0:
-                prefix_rep_ms += float(m["timings_ms"].get("prefix_encode_ms", 0.0)) * (
-                    pref_enc["repeated_calls"] / pref_enc["calls"]
-                )
-            elif m["prefix_kv_repeated"]:
-                prefix_rep_ms += float(m["timings_ms"].get("prefix_encode_ms", 0.0))
-        target_pre_rep_ms = float(
-            sum(
-                m["timings_ms"].get("target_image_preprocess_ms", 0.0)
-                for m in micro_list
-                if m["target_image_repeated"]
+        repeated_stage_timings_ms = dict.fromkeys(self.schema.repeatable_stages, 0.0)
+        for stage, kind in self.schema.host_repeat_stages:
+            repeated_stage_timings_ms[stage] = float(
+                sum(m["timings_ms"].get(stage, 0.0) for m in micro_list if m["transfers"][kind]["repeated_calls"])
             )
+        for spec in self.schema.encodes:
+            if not spec.global_repeat:
+                continue
+            for m in micro_list:
+                enc = m["encodes"].get(spec.kind)
+                if enc and enc["calls"]:
+                    repeated_stage_timings_ms[spec.stage] += (
+                        float(m["timings_ms"].get(spec.stage, 0.0)) * enc["repeated_calls"] / enc["calls"]
+                    )
+        repeated_stage_timings_ms["condition_repeated_ms"] = sum(
+            repeated_stage_timings_ms.get(stage, 0.0) for stage in self.schema.condition_stages
         )
-        repeated_stage_timings_ms = {
-            "ref_image_preprocess_ms": ref_pre_rep_ms,
-            "ref_vision_encode_ms": ref_vis_rep_ms,
-            "prefix_encode_ms": prefix_rep_ms,
-            "target_image_preprocess_ms": target_pre_rep_ms,
-            "condition_repeated_ms": ref_pre_rep_ms + ref_vis_rep_ms + prefix_rep_ms,
-            "train_ms": ref_pre_rep_ms + ref_vis_rep_ms + prefix_rep_ms + target_pre_rep_ms,
-        }
+        repeated_stage_timings_ms["train_ms"] = sum(
+            repeated_stage_timings_ms[stage] for stage in self.schema.repeatable_stages if stage != "train_ms"
+        )
 
         step_transfers = {
             k: {
@@ -767,10 +836,11 @@ class ConditionTracker:
                 "repeated_calls": sum(m["transfers"][k]["repeated_calls"] for m in micro_list),
                 "repeated_bytes": sum(m["transfers"][k]["repeated_bytes"] for m in micro_list),
             }
-            for k in TRANSFER_KINDS
+            for k in self.transfer_specs
         }
         cpu_rss_bytes, cpu_peak_rss_bytes = _read_cpu_memory_bytes()
         step_record = {
+            "tracker_schema": self.schema.name,
             "rank": self.rank,
             "world_size": self.world_size,
             "step": self.current_step,
@@ -804,7 +874,7 @@ class ConditionTracker:
         window_records = perf_records if perf_records else self.step_records
 
         encoding_summary: dict[str, Any] = {}
-        for kind in ENCODE_KINDS:
+        for kind in self.encode_specs:
             st = dict(self.encode_stats[kind])
             calls = int(st["calls"])
             repeated = int(st["repeated_calls"])
@@ -816,7 +886,7 @@ class ConditionTracker:
         tot_bytes = 0
         tot_rep_calls = 0
         tot_rep_bytes = 0
-        for kind in TRANSFER_KINDS:
+        for kind in self.transfer_specs:
             st = self.transfer_stats[kind]
             c = int(st["total_transfer_calls"])
             b = int(st["total_transfer_bytes"])
@@ -847,15 +917,9 @@ class ConditionTracker:
 
         train_values = [float(r["stage_timings_ms"]["train_ms"]) for r in window_records]
         train_mean_ms = float(np.mean(train_values)) if train_values else 0.0
-        repeatable_stages = {
-            "ref_image_preprocess_ms",
-            "ref_vision_encode_ms",
-            "prefix_encode_ms",
-            "target_image_preprocess_ms",
-            "train_ms",
-        }
+        repeatable_stages = self.schema.repeatable_stages
         stage_summary: dict[str, Any] = {}
-        for stage in ALL_STAGE_NAMES:
+        for stage in self.schema.stage_order:
             vals = [float(r["stage_timings_ms"].get(stage, 0.0)) for r in window_records]
             rep_vals = (
                 [float(r["repeated_stage_timings_ms"].get(stage, 0.0)) for r in window_records]
@@ -864,7 +928,9 @@ class ConditionTracker:
             )
             stage_summary[stage] = _summarize_timing_series(vals, train_mean_ms, local_repeated_values=rep_vals)
 
-        feature_summary = {key: _summarize_feature_bytes(self.feature_byte_records[key]) for key in FEATURE_BYTE_KEYS}
+        feature_summary = {
+            key: _summarize_feature_bytes(self.feature_byte_records[key]) for key in self.schema.feature_byte_keys
+        }
 
         step_alloc_vals = [int(r["memory"]["step_peak_allocated_bytes"]) for r in window_records]
         step_res_vals = [int(r["memory"]["step_peak_reserved_bytes"]) for r in window_records]
@@ -882,6 +948,7 @@ class ConditionTracker:
         gib = float(1024**3)
 
         return {
+            "tracker_schema": self.schema.name,
             "rank": self.rank,
             "world_size": self.world_size,
             "micro_batches": self.micro_batches,
@@ -959,6 +1026,25 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
 
     ranks = sorted(rank_step_records)
     first_rank_steps = rank_step_records[ranks[0]]
+    schema_paths = {
+        record.get("tracker_schema", SENSENOVA_TRACKER_SCHEMA.name)
+        for records in rank_step_records.values()
+        for record in records
+    }
+    schema_paths.update(data.get("tracker_schema", SENSENOVA_TRACKER_SCHEMA.name) for data in rank_summaries.values())
+    if len(schema_paths) != 1:
+        raise ValueError("Baseline files use different tracker schemas")
+    schema_path = schema_paths.pop()
+    if schema_path == SENSENOVA_TRACKER_SCHEMA.name:
+        schema = SENSENOVA_TRACKER_SCHEMA
+    else:
+        from relax.utils.misc import load_function
+
+        schema = load_function(schema_path)
+    if not isinstance(schema, TrackerSchema):
+        raise TypeError(f"Invalid tracker schema: {schema_path}")
+    transfer_specs = {spec.kind: spec for spec in schema.transfers}
+    encode_specs = {spec.kind: spec for spec in schema.encodes}
     world_size = int(first_rank_steps[0]["world_size"])
     warmup_steps = int(
         rank_summaries[ranks[0]]["warmup_steps"]
@@ -987,10 +1073,10 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
     global_repeated_samples = 0
     padding_samples = 0
 
-    global_seen_encode_keys: dict[str, set[str]] = {k: set() for k in ENCODE_KINDS}
+    global_seen_encode_keys: dict[str, set[str]] = {k: set() for k in encode_specs}
     encode_agg: dict[str, dict[str, Any]] = {
-        kind: {
-            "eligible": False if kind == "gen_vision_encode" else None,
+        spec.kind: {
+            "eligible": spec.eligible,
             "calls": 0,
             "items": 0,
             "local_repeated_calls": 0,
@@ -1000,11 +1086,13 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
             "cache_misses": 0,
             "cache_hit_rate": 0.0,
         }
-        for kind in ENCODE_KINDS
+        for spec in schema.encodes
     }
-    encode_agg["ref_vision_encode"]["encoded_images"] = 0
+    for spec in schema.encodes:
+        if spec.items_field:
+            encode_agg[spec.kind][spec.items_field] = 0
 
-    global_seen_transfer_keys: dict[str, set[str]] = {k: set() for k in TRANSFER_KINDS}
+    global_seen_transfer_keys: dict[str, set[str]] = {k: set() for k in transfer_specs}
     transfer_agg: dict[str, dict[str, int]] = {
         k: {
             "total_transfer_calls": 0,
@@ -1014,10 +1102,10 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
             "global_repeated_transfer_calls": 0,
             "global_repeated_transfer_bytes": 0,
         }
-        for k in TRANSFER_KINDS
+        for k in transfer_specs
     }
 
-    feature_bytes_all: dict[str, list[int]] = {k: [] for k in FEATURE_BYTE_KEYS}
+    feature_bytes_all: dict[str, list[int]] = {k: [] for k in schema.feature_byte_keys}
 
     first_seen_prefix_local: dict[tuple[int, str], dict[str, Any]] = {}
     first_seen_prefix_global: dict[str, dict[str, Any]] = {}
@@ -1048,45 +1136,17 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
         else:
             global_seen_samples.add(sample_id)
 
-        for fkey in FEATURE_BYTE_KEYS:
+        for fkey in schema.feature_byte_keys:
             if fkey in micro_rec.get("feature_bytes", {}):
                 feature_bytes_all[fkey].append(int(micro_rec["feature_bytes"][fkey]))
 
         step_glob_rep = global_repeated_step_timings.setdefault(
             (rank, step_idx),
-            {
-                "ref_image_preprocess_ms": 0.0,
-                "ref_vision_encode_ms": 0.0,
-                "prefix_encode_ms": 0.0,
-                "target_image_preprocess_ms": 0.0,
-                "train_ms": 0.0,
-            },
+            dict.fromkeys(schema.repeatable_stages, 0.0),
         )
 
-        # Aggregate transfer bytes
-        ref_image_keys = micro_rec.get("ref_image_keys", [])
-        ref_img_glob_rep = any(k in global_seen_transfer_keys["ref_pixel_values"] for k in ref_image_keys)
-        for k in ref_image_keys:
-            global_seen_transfer_keys["ref_pixel_values"].add(k)
-            global_seen_transfer_keys["ref_grid_hw"].add(k)
-
-        prefix_key = micro_rec.get("prefix_kv_key", "")
-        prefix_tr_glob_rep = bool(prefix_key) and (prefix_key in global_seen_transfer_keys["prefix_input_ids"])
-        if prefix_key:
-            global_seen_transfer_keys["prefix_input_ids"].add(prefix_key)
-
-        target_key = micro_rec.get("target_image_key", "")
-        target_tr_glob_rep = bool(target_key) and (target_key in global_seen_transfer_keys["target_input_latents"])
-        if target_key:
-            global_seen_transfer_keys["target_input_latents"].add(target_key)
-
-        glob_rep_by_kind = {
-            "ref_pixel_values": ref_img_glob_rep,
-            "ref_grid_hw": ref_img_glob_rep,
-            "prefix_input_ids": prefix_tr_glob_rep,
-            "target_input_latents": target_tr_glob_rep,
-        }
-        for tkind in TRANSFER_KINDS:
+        glob_rep_by_kind = {}
+        for tkind, spec in transfer_specs.items():
             tr_info = micro_rec["transfers"][tkind]
             c = int(tr_info["calls"])
             b = int(tr_info["bytes"])
@@ -1097,21 +1157,34 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
             agg["total_transfer_bytes"] += b
             agg["local_repeated_transfer_calls"] += rc
             agg["local_repeated_transfer_bytes"] += rb
-            if glob_rep_by_kind[tkind]:
-                agg["global_repeated_transfer_calls"] += c
-                agg["global_repeated_transfer_bytes"] += b
+            seen = global_seen_transfer_keys[tkind]
+            if "events" in tr_info:
+                repeated = False
+                for event in tr_info["events"]:
+                    key = event["key"]
+                    if key and key in seen:
+                        repeated = True
+                        agg["global_repeated_transfer_calls"] += 1
+                        agg["global_repeated_transfer_bytes"] += int(event["bytes"])
+                    if key:
+                        seen.add(key)
+            else:
+                keys = micro_rec.get(spec.key_field, []) if spec.per_image else [micro_rec.get(spec.key_field, "")]
+                repeated = any(key and key in seen for key in keys)
+                seen.update(key for key in keys if key)
+                if repeated:
+                    agg["global_repeated_transfer_calls"] += c
+                    agg["global_repeated_transfer_bytes"] += b
+            glob_rep_by_kind[tkind] = repeated
 
-        if ref_img_glob_rep:
-            t_ms = float(micro_rec["timings_ms"].get("ref_image_preprocess_ms", 0.0))
-            step_glob_rep["ref_image_preprocess_ms"] += t_ms
-            step_glob_rep["train_ms"] += t_ms
-        if target_tr_glob_rep:
-            t_ms = float(micro_rec["timings_ms"].get("target_image_preprocess_ms", 0.0))
-            step_glob_rep["target_image_preprocess_ms"] += t_ms
-            step_glob_rep["train_ms"] += t_ms
+        for stage, kind in schema.host_repeat_stages:
+            if glob_rep_by_kind[kind]:
+                t_ms = float(micro_rec["timings_ms"].get(stage, 0.0))
+                step_glob_rep[stage] += t_ms
+                step_glob_rep["train_ms"] += t_ms
 
         # Aggregate encoder calls and collect repeat examples
-        for ekind in ENCODE_KINDS:
+        for ekind, spec in encode_specs.items():
             enc_info = micro_rec.get("encodes", {}).get(ekind)
             if enc_info is None:
                 continue
@@ -1121,8 +1194,8 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
             items = int(enc_info["items"])
             agg["calls"] += calls
             agg["items"] += items
-            if ekind == "ref_vision_encode":
-                agg["encoded_images"] += items
+            if spec.items_field:
+                agg[spec.items_field] += items
             local_rep_calls = int(
                 enc_info["repeated_calls"]
                 if "repeated_calls" in enc_info
@@ -1130,7 +1203,7 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
             )
             agg["local_repeated_calls"] += local_rep_calls
 
-            if ekind in ("ref_vision_encode", "prefix_encode"):
+            if spec.global_repeat:
                 ekeys = enc_info.get("keys")
                 if not ekeys:
                     ekeys = [enc_info["key"]] if enc_info.get("key") else []
@@ -1141,38 +1214,28 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
                     global_seen_encode_keys[ekind].add(ekey)
                 if glob_rep_in_micro > 0:
                     agg["global_repeated_calls"] += glob_rep_in_micro
-                    stage_key = "ref_vision_encode_ms" if ekind == "ref_vision_encode" else "prefix_encode_ms"
+                    stage_key = spec.stage
                     t_ms = float(micro_rec["timings_ms"].get(stage_key, 0.0)) * (
                         glob_rep_in_micro / max(len(ekeys), 1)
                     )
                     step_glob_rep[stage_key] += t_ms
                     step_glob_rep["train_ms"] += t_ms
 
+        evidence = schema.evidence
+        prefix_key = micro_rec.get(evidence.key_field, "")
         if prefix_key:
+            h2d_bytes = sum(micro_rec["transfers"][kind]["bytes"] for kind in evidence.h2d_transfers)
             occurrence_meta = {
                 "rank": rank,
                 "step": step_idx,
                 "micro": micro_idx,
                 "sample_id": sample_id,
                 "is_padding": bool(micro_rec.get("is_padding", False)),
-                "prefix_kv_key": prefix_key,
-                "ref_vision_key": micro_rec.get("ref_vision_key", ""),
-                "ref_h2d_bytes": int(
-                    micro_rec["transfers"]["ref_pixel_values"]["bytes"]
-                    + micro_rec["transfers"]["ref_grid_hw"]["bytes"]
-                    + micro_rec["transfers"]["prefix_input_ids"]["bytes"]
-                ),
-                "ref_h2d_mib": float(
-                    (
-                        micro_rec["transfers"]["ref_pixel_values"]["bytes"]
-                        + micro_rec["transfers"]["ref_grid_hw"]["bytes"]
-                        + micro_rec["transfers"]["prefix_input_ids"]["bytes"]
-                    )
-                    / (1024.0 * 1024.0)
-                ),
-                "ref_image_preprocess_ms": float(micro_rec["timings_ms"].get("ref_image_preprocess_ms", 0.0)),
-                "ref_vision_encode_ms": float(micro_rec["timings_ms"].get("ref_vision_encode_ms", 0.0)),
-                "prefix_encode_ms": float(micro_rec["timings_ms"].get("prefix_encode_ms", 0.0)),
+                evidence.key_field: prefix_key,
+                **{key: micro_rec.get(key, "") for key in evidence.extra_key_fields},
+                f"{evidence.h2d_name}_bytes": int(h2d_bytes),
+                f"{evidence.h2d_name}_mib": float(h2d_bytes / (1024.0 * 1024.0)),
+                **{stage: float(micro_rec["timings_ms"].get(stage, 0.0)) for stage in evidence.stages},
             }
             local_pair = (rank, prefix_key)
             if local_pair in first_seen_prefix_local:
@@ -1214,7 +1277,7 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
         "global_repeated_transfer_calls": 0,
         "global_repeated_transfer_bytes": 0,
     }
-    for tkind in TRANSFER_KINDS:
+    for tkind in transfer_specs:
         agg = transfer_agg[tkind]
         for k in tot_tr:
             tot_tr[k] += int(agg[k])
@@ -1263,15 +1326,9 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
     ]
     overall_train_mean_ms = float(np.mean(step_mean_train_ms)) if step_mean_train_ms else 0.0
 
-    repeatable_stages = {
-        "ref_image_preprocess_ms",
-        "ref_vision_encode_ms",
-        "prefix_encode_ms",
-        "target_image_preprocess_ms",
-        "train_ms",
-    }
+    repeatable_stages = schema.repeatable_stages
     stage_summary: dict[str, Any] = {}
-    for stage in ALL_STAGE_NAMES:
+    for stage in schema.stage_order:
         step_means = [
             float(np.mean([r["stage_timings_ms"].get(stage, 0.0) for r in all_steps_by_idx[s]]))
             for s in window_step_indices
@@ -1306,7 +1363,7 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
             global_repeated_values=global_rep_means,
         )
 
-    feature_summary = {key: _summarize_feature_bytes(feature_bytes_all[key]) for key in FEATURE_BYTE_KEYS}
+    feature_summary = {key: _summarize_feature_bytes(feature_bytes_all[key]) for key in schema.feature_byte_keys}
 
     window_rank_records = [r for s in window_step_indices for r in all_steps_by_idx[s]]
     all_rank_records = [r for s in sorted_step_indices for r in all_steps_by_idx[s]]
@@ -1381,6 +1438,8 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
     cache_stats = {
         str(rank): data["condition_cache"] for rank, data in rank_summaries.items() if "condition_cache" in data
     }
+    if "tracker_schema" in first_rank_steps[0]:
+        summary["tracker_schema"] = schema.name
     if cache_stats:
         summary["condition_cache"] = cache_stats
     baseline_summary_path = out_path / "baseline_summary.json"
@@ -1389,7 +1448,9 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
+    from relax.engine.sft.condition_tracker import summarize_baseline_dir as summarize_directory
+
     if len(sys.argv) != 2:
         raise SystemExit("Usage: python3 -m relax.engine.sft.condition_tracker <output_dir>")
-    result = summarize_baseline_dir(Path(sys.argv[1]))
+    result = summarize_directory(Path(sys.argv[1]))
     print(json.dumps(result, indent=2, ensure_ascii=False))

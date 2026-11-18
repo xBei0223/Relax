@@ -86,14 +86,13 @@ def test_condition_repeat_and_padding_counts_across_epochs(tmp_path: Path) -> No
                     tracker.record_encode(
                         "ref_vision_encode",
                         num_items=len(edit_list),
-                        output_bytes=len(edit_list) * 1024,
+                        feature_bytes={"ref_vision_embeds_bytes": len(edit_list) * 1024},
                     )
                 with tracker.gpu_stage("prefix_encode_ms"):
                     tracker.record_encode(
                         "prefix_encode",
                         num_items=1,
-                        output_bytes=4096,
-                        indexes_image_bytes=128,
+                        feature_bytes={"past_key_values_bytes": 4096, "indexes_image_bytes": 128},
                     )
 
                 with tracker.host_stage("target_image_preprocess_ms"):
@@ -101,7 +100,7 @@ def test_condition_repeat_and_padding_counts_across_epochs(tmp_path: Path) -> No
                     tracker.record_transfer("target_input_latents", latents)
 
                 with tracker.gpu_stage("gen_vision_encode_ms"):
-                    tracker.record_encode("gen_vision_encode", num_items=1, output_bytes=2048, eligible=False)
+                    tracker.record_encode("gen_vision_encode", num_items=1, eligible=False)
                 with tracker.gpu_stage("dit_forward_ms"):
                     pass
                 with tracker.gpu_stage("backward_ms"):
@@ -236,13 +235,17 @@ def test_transfer_bytes_and_feature_tensor_sizes_without_retaining_tensors(tmp_p
     tracker.record_transfer("ref_pixel_values", bf16_tensor, image_index=0)
     tracker.record_transfer("prefix_input_ids", int64_tensor)
     tracker.record_encode(
-        "ref_vision_encode", num_items=1, output_bytes=vision_embeds.numel() * vision_embeds.element_size()
+        "ref_vision_encode",
+        num_items=1,
+        feature_bytes={"ref_vision_embeds_bytes": vision_embeds.numel() * vision_embeds.element_size()},
     )
     tracker.record_encode(
         "prefix_encode",
         num_items=1,
-        output_bytes=compute_past_key_values_bytes(kv_cache),
-        indexes_image_bytes=int(indexes_image.numel() * indexes_image.element_size()),
+        feature_bytes={
+            "past_key_values_bytes": compute_past_key_values_bytes(kv_cache),
+            "indexes_image_bytes": int(indexes_image.numel() * indexes_image.element_size()),
+        },
     )
     tracker.end_step(0, 0.001, 0.01)
 
@@ -370,11 +373,13 @@ def _run_two_step_sft(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enable_tr
                     tracker.record_transfer("ref_pixel_values", x, image_index=0)
                 tracker.set_prefix_context(str(data["prompt"]), is_positive=True, think_mode=False)
                 with tracker.gpu_stage("ref_vision_encode_ms"):
-                    tracker.record_encode("ref_vision_encode", 1, output_bytes=64)
+                    tracker.record_encode("ref_vision_encode", 1, {"ref_vision_embeds_bytes": 64})
                 with tracker.gpu_stage("prefix_encode_ms"):
-                    tracker.record_encode("prefix_encode", 1, output_bytes=128, indexes_image_bytes=16)
+                    tracker.record_encode(
+                        "prefix_encode", 1, {"past_key_values_bytes": 128, "indexes_image_bytes": 16}
+                    )
                 with tracker.gpu_stage("gen_vision_encode_ms"):
-                    tracker.record_encode("gen_vision_encode", 1, output_bytes=64, eligible=False)
+                    tracker.record_encode("gen_vision_encode", 1, eligible=False)
                 with tracker.gpu_stage("dit_forward_ms"):
                     noise = torch.randn_like(self.weight)
                     out = (self.weight * x + noise * 0.1).square().mean()

@@ -9,6 +9,8 @@ repos:
       rev: v4.4.0
       hooks:
       -   id: check-added-large-files
+          # All tensors inside the DiffSynth reference archive are verified by manifest.json.
+          exclude: ^tests/cpu/models/fixtures/qwen_image_edit_diffsynth_f7b7db96\.tar\.xz$
       -   id: check-merge-conflict
           args: ['--assume-in-merge']
       -   id: check-symlinks

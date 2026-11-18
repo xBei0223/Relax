@@ -664,6 +664,7 @@ def validate_i2i_sft_config(args: Namespace) -> None:
             "dp_tier_rank_rotation",
             "baseline_stats_dir",
             "baseline_warmup_steps",
+            "transformer_gradient_checkpointing",
         }
     )
     _fail(errors, bool(unknown), f"Unknown i2i_sft_config keys: {sorted(unknown)}")
@@ -747,6 +748,9 @@ def validate_i2i_sft_config(args: Namespace) -> None:
     args.model_adapter_path = (
         getattr(args, "model_adapter_path", None) or "relax.models.sensenova.adapter.SenseNovaSFTAdapter"
     )
+    from relax.utils.misc import load_function
+
+    errors.extend(load_function(args.model_adapter_path).validate_sft_config(config))
     # These controls have no implementation in the supervised image path.
     for field in (
         "fully_async",
