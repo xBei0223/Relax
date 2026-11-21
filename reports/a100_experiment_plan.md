@@ -1,6 +1,6 @@
 # A100 补充实验执行方案
 
-[材料说明](../README.md) · [任务要求](https://github.com/redai-studio/community/blob/main/contributor-program/2026-cohort-2/official-task.md#task-17) · [A100 实验报告](a100_training_report.md) · [4090 训练报告](real_training_report.md)
+[材料说明](../README.md) · [任务要求](https://github.com/redai-studio/community/blob/main/contributor-program/2026-cohort-2/official-task.md#task-17) · [A100 实验报告](a100_training_report.md) · [4090 训练报告](real_training_report.md) · [Qwen A100 实验报告](qwen_training_report.md)
 
 本文件规定在 2 × NVIDIA A100-SXM4-40GB 上执行的全部实验，覆盖除第二种模型之外的 R1–R9。所有对比只在 A100 的实验之间进行；4090 的结果保留为另一套配置的记录，不与本方案的数据混合比较。GPU 数量变化对组内复用率的影响需要更多 GPU，本方案不测量，在报告中按缓存设计的性能适用条件分析说明：组内复用要求全部 rank 在同一 micro-batch 同时命中，rank 数增加时同时命中的概率随之减小。
 

@@ -1,6 +1,6 @@
 # A100 补充实验记录
 
-[材料说明](../README.md) · [实验计划](a100_experiment_plan.md) · [4090 训练报告](real_training_report.md)
+[材料说明](../README.md) · [实验计划](a100_experiment_plan.md) · [4090 训练报告](real_training_report.md) · [Qwen A100 实验报告](qwen_training_report.md)
 
 ## 环境准备
 

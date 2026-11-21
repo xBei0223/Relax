@@ -1,6 +1,6 @@
 # 冻结条件缓存完整规模训练报告
 
-[材料说明](../README.md) · [A100 实验计划](a100_experiment_plan.md) · [A100 实验报告](a100_training_report.md) · [PR 正文](https://github.com/redai-studio/Relax/pull/571)
+[材料说明](../README.md) · [A100 实验计划](a100_experiment_plan.md) · [A100 实验报告](a100_training_report.md) · [Qwen A100 实验报告](qwen_training_report.md) · [PR 正文](https://github.com/redai-studio/Relax/pull/571)
 
 本报告记录 2026-11-12（Asia/Shanghai）在官方 Docker 镜像中使用完整规模 SenseNova 模型完成的真实 SFT 训练实验。实验覆盖 R1 在线基线、R3–R5 训练数值、R6–R7 端到端性能及 R8 容量与资源。第二种模型暂时搁置，不在本报告范围内。
 
